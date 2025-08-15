@@ -1,139 +1,141 @@
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+
 from ddpg_agent import DDPGAgent
 from ppo_agent import PPOAgent
 from a2c_agent import A2CAgent
-import ta
 
 
-class ImprovedNiftyTradingEnv:
+def calculate_technical_indicators(df):
+    close_col = [col for col in df.columns if 'close' in col.lower().strip()][0]
+    high_col = [col for col in df.columns if 'high' in col.lower().strip()][0]
+    low_col = [col for col in df.columns if 'low' in col.lower().strip()][0]
+    
+    close_prices = df[close_col]
+    high_prices = df[high_col]
+    low_prices = df[low_col]
 
-    def __init__(self, price_data, technical_indicators, initial_balance=1000000, transaction_cost=0.0005):
+    ema12 = close_prices.ewm(span=12).mean()
+    ema26 = close_prices.ewm(span=26).mean()
+    macd = ema12 - ema26
+    
+    delta = close_prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / (loss + 1e-8)
+    rsi = 100 - (100 / (1 + rs))
+    
+    tp = (high_prices + low_prices + close_prices) / 3
+    sma_tp = tp.rolling(window=20).mean()
+    mad = tp.rolling(window=20).apply(lambda x: np.mean(np.abs(x - x.mean())))
+    cci = (tp - sma_tp) / (0.015 * (mad + 1e-8))
+    
+    high_diff = high_prices.diff()
+    adx = high_diff.rolling(window=14).mean().abs()  
+    
+    macd = macd.fillna(0)
+    rsi = rsi.fillna(50)
+    cci = cci.fillna(0)
+    adx = adx.fillna(25)
+    
+    return macd.values, rsi.values, cci.values, adx.values
+
+
+class StockTradingEnv:
+    def __init__(self, price_data, indicator_data, initial_balance=1e6, transaction_cost=0.001):
         self.price_data = price_data
-        self.technical_indicators = technical_indicators
+        self.indicator_data = indicator_data
+        self.num_stocks = price_data.shape[1]
         self.initial_balance = initial_balance
         self.transaction_cost = transaction_cost
-        self.max_position = 2000
+        self.max_shares = 100
 
-        self.returns = np.diff(price_data) / price_data[:-1]
-        self.returns = np.concatenate([[0], self.returns])
+        self.state_dim = 1 + self.num_stocks + self.num_stocks + 4 * self.num_stocks
+        self.action_dim = self.num_stocks
 
-        self.sma_short = self._calculate_sma(price_data, 5)
-        self.sma_long = self._calculate_sma(price_data, 20)
-
-        self.state_dim = 10
-        self.action_dim = 1
+        self.current_step = 0
+        self.balance = None
+        self.holdings = None
+        self.prices = None
+        self.macd = None
+        self.rsi = None
+        self.cci = None
+        self.adx = None
 
         self.reset()
-
-    def _calculate_sma(self, prices, window):
-        sma = np.zeros(len(prices))
-        for i in range(len(prices)):
-            start_idx = max(0, i - window + 1)
-            sma[i] = np.mean(prices[start_idx:i+1])
-        return sma
 
     def reset(self):
         self.current_step = 0
         self.balance = self.initial_balance
-        self.position = 0
-        self.done = False
-        self.prev_portfolio_value = self.initial_balance
+        self.holdings = np.zeros(self.num_stocks)
+
+        self.prices = self.price_data[self.current_step]
+        self.macd = self.indicator_data['macd'][self.current_step]
+        self.rsi = self.indicator_data['rsi'][self.current_step]
+        self.cci = self.indicator_data['cci'][self.current_step]
+        self.adx = self.indicator_data['adx'][self.current_step]
 
         return self._get_state()
 
     def _get_state(self):
-        current_price = self.price_data[self.current_step]
-
-        momentum_window = 3
-        start_idx = max(0, self.current_step - momentum_window + 1)
-        recent_returns = self.returns[start_idx:self.current_step + 1]
-        price_momentum = np.mean(recent_returns) if len(recent_returns) > 0 else 0
-
-        trend_signal = (self.sma_short[self.current_step] - self.sma_long[self.current_step]) / self.sma_long[self.current_step]
-
-        vol_window = 10
-        start_idx = max(0, self.current_step - vol_window + 1)
-        recent_returns_vol = self.returns[start_idx:self.current_step + 1]
-        volatility = np.std(recent_returns_vol) if len(recent_returns_vol) > 1 else 0
-
-        state = np.array([
-            (self.balance / self.initial_balance - 0.5) * 2,
-            (current_price / np.mean(self.price_data) - 1),
-            self.position / self.max_position,
-            np.clip(price_momentum * 100, -1, 1),
-            np.clip(trend_signal, -0.5, 0.5) * 2,
-            np.clip(self.technical_indicators['MACD'][self.current_step] / 50.0, -1, 1),
-            (self.technical_indicators['RSI'][self.current_step] - 50) / 50,
-            np.clip(self.technical_indicators['CCI'][self.current_step] / 200.0, -1, 1),
-            (self.technical_indicators['ADX'][self.current_step] - 25) / 50,
-            np.clip(volatility * 100, 0, 1)
+        state = np.concatenate([
+            [self.balance / self.initial_balance],
+            self.prices / 30000.0,
+            self.holdings / 100.0,
+            self.macd / 100.0,
+            self.rsi / 100.0,
+            self.cci / 200.0,
+            self.adx / 100.0
         ])
-
         return state.astype(np.float32)
 
-    def step(self, action):
-        action_val = np.clip(action, -1, 1)[0] if isinstance(action, np.ndarray) else np.clip(action, -1, 1)
+    def step(self, actions):
+        actions = np.clip(actions, -1, 1)
+        shares_to_trade = (actions * self.max_shares).astype(int)
 
-        current_price = self.price_data[self.current_step]
-        portfolio_value_before = self.balance + self.position * current_price
+        portfolio_value_before = self.balance + np.sum(self.holdings * self.prices)
+        total_transaction_cost = 0.0
 
-        desired_position_change = int(action_val * self.max_position * 0.5)
-
-        total_cost = 0
-        if desired_position_change != 0:
-            trade_value = abs(desired_position_change) * current_price
-            cost = trade_value * self.transaction_cost
-
-            if desired_position_change > 0:
-                max_affordable = int(self.balance / (current_price * (1 + self.transaction_cost)))
-                actual_trade = min(desired_position_change, max_affordable)
-                if actual_trade > 0:
-                    self.balance -= actual_trade * current_price * (1 + self.transaction_cost)
-                    self.position += actual_trade
-                    total_cost = actual_trade * current_price * self.transaction_cost
-            else: 
-                actual_trade = max(desired_position_change, -self.position)
-                if actual_trade < 0:
-                    self.balance += abs(actual_trade) * current_price * (1 - self.transaction_cost)
-                    self.position += actual_trade
-                    total_cost = abs(actual_trade) * current_price * self.transaction_cost
+        for i, shares in enumerate(shares_to_trade):
+            if shares > 0:
+                cost = shares * self.prices[i] * (1 + self.transaction_cost)
+                if cost <= self.balance:
+                    self.balance -= cost
+                    self.holdings[i] += shares
+                    total_transaction_cost += cost * self.transaction_cost
+            elif shares < 0:
+                sell_shares = min(-shares, self.holdings[i])
+                if sell_shares > 0:
+                    revenue = sell_shares * self.prices[i] * (1 - self.transaction_cost)
+                    self.balance += revenue
+                    self.holdings[i] -= sell_shares
+                    total_transaction_cost += sell_shares * self.prices[i] * self.transaction_cost
 
         self.current_step += 1
+        done = False
+        if self.current_step >= len(self.price_data):
+            done = True
+            self.current_step = len(self.price_data) - 1
 
-        if self.current_step >= len(self.price_data) - 1:
-            self.done = True
-            next_price = current_price
-        else:
-            next_price = self.price_data[self.current_step]
+        self.prices = self.price_data[self.current_step]
+        self.macd = self.indicator_data['macd'][self.current_step]
+        self.rsi = self.indicator_data['rsi'][self.current_step]
+        self.cci = self.indicator_data['cci'][self.current_step]
+        self.adx = self.indicator_data['adx'][self.current_step]
 
-        portfolio_value_after = self.balance + self.position * next_price
+        portfolio_value_after = self.balance + np.sum(self.holdings * self.prices)
+        reward = (portfolio_value_after - portfolio_value_before) - total_transaction_cost
+        reward /= self.initial_balance
 
-        basic_pnl = (portfolio_value_after - portfolio_value_before - total_cost) / self.initial_balance
-        market_return = (next_price - current_price) / current_price if not self.done else 0
-        position_reward = 0
-        if self.position > 0 and market_return > 0: position_reward = 0.001
-        elif self.position < 0 and market_return < 0: position_reward = 0.001
-        elif abs(self.position) > 0 and market_return * np.sign(self.position) < 0: position_reward = -0.0005
-        trend_reward = 0
-        if not self.done:
-            short_ma = self.sma_short[self.current_step]
-            long_ma = self.sma_long[self.current_step]
-            if short_ma > long_ma and self.position > 0: trend_reward = 0.0005
-            elif short_ma < long_ma and self.position < 0: trend_reward = 0.0005
-        trading_penalty = -abs(desired_position_change) / self.max_position * 0.0001
-        reward = basic_pnl + position_reward + trend_reward + trading_penalty
-        if portfolio_value_after > 0.5 * self.initial_balance: reward += 0.0001
         if portfolio_value_after <= 0.1 * self.initial_balance:
-            self.done = True
-            reward = -0.1
+            done = True
 
-        self.prev_portfolio_value = portfolio_value_after
+        next_state = self._get_state()
+        info = {"portfolio_value": portfolio_value_after}
+        return next_state, reward, done, info
 
-        return self._get_state(), reward, self.done, {'portfolio_value': portfolio_value_after}
 
-class ImprovedEnsembleStrategy:
+class EnsembleStrategy:
 
     def __init__(self, state_dim, action_dim):
         self.state_dim = state_dim
@@ -144,247 +146,199 @@ class ImprovedEnsembleStrategy:
         self.a2c_agent = A2CAgent(state_dim, action_dim)
 
         self.agent_performances = {'DDPG': [], 'PPO': [], 'A2C': []}
-        self.current_best_agent = None
 
-    def calculate_performance_metric(self, returns, benchmark_returns):
-        if len(returns) == 0: return -np.inf
-        returns_arr = np.array(returns)
-        daily_rf = 0.02 / 252
-        excess_returns = returns_arr - daily_rf
-        sharpe = np.mean(excess_returns) / (np.std(excess_returns) + 1e-8)
-        if len(benchmark_returns) == len(returns):
-            benchmark_arr = np.array(benchmark_returns)
-            alpha = np.mean(returns_arr - benchmark_arr)
-        else:
-            alpha = 0
-        return sharpe + alpha * 10
+    def calculate_sharpe_ratio(self, returns, risk_free_rate=0.02):
+        if len(returns) == 0:
+            return float('-inf')
+        daily_rf = risk_free_rate / 252
+        mean_ret = np.mean(returns)
+        std_ret = np.std(returns) + 1e-8
+        sharpe = (mean_ret - daily_rf) / std_ret
+        return sharpe
 
-    def get_agent(self, agent_name):
-        agent_map = {'DDPG': self.ddpg_agent, 'PPO': self.ppo_agent, 'A2C': self.a2c_agent}
-        if agent_name in agent_map:
-            return agent_map[agent_name]
-        raise ValueError(f"Unknown agent: {agent_name}")
-
-    def train_all_agents(self, env, episodes=30):
-        print(f"\nTraining all agents for {episodes} episodes")
-        agent_returns = {'DDPG': [], 'PPO': [], 'A2C': []}
-        max_steps = len(env.price_data) - 1
-
-        for episode in range(episodes):
-            if episode % max(1, episodes // 10) == 0:
-                print(f"Episode {episode}/{episodes}")
-
-            for agent_name in ['DDPG', 'PPO', 'A2C']:
-                state = env.reset()
-                episode_return = 0
-                agent = self.get_agent(agent_name)
-
-                for step in range(max_steps):
-                    if agent_name == 'DDPG':
-                        action = agent.select_action(state, add_noise=True)
-                        next_state, reward, done, info = env.step(action)
-                        agent.add_experience(state, action, reward, next_state, done)
-                        if len(agent.replay_buffer) > 64: agent.train(64)
-                    elif agent_name == 'PPO':
-                        action, log_prob, value = agent.select_action(state)
-                        next_state, reward, done, info = env.step(action)
-                        agent.store_transition(state, action, reward, log_prob, value, done)
-                        if len(agent.states) >= 32: agent.update()
-                    elif agent_name == 'A2C':
-                        action, log_prob, value = agent.select_action(state)
-                        next_state, reward, done, info = env.step(action)
-                        agent.store_transition(state, action, reward, next_state, done, log_prob, value)
-                        if len(agent.states) >= 16: agent.update()
-                    
-                    state = next_state
-                    episode_return += reward
-                    if done: break
-                
-                agent_returns[agent_name].append(episode_return)
-        return agent_returns
-
-    def select_best_agent(self, validation_returns, benchmark_returns=None):
-        performance_scores = {}
-        for agent_name, returns in validation_returns.items():
-            if benchmark_returns:
-                score = self.calculate_performance_metric(returns, benchmark_returns)
-            else:
-                if len(returns) == 0: score = -np.inf
-                else:
-                    returns_arr = np.array(returns)
-                    score = np.mean(returns_arr) / (np.std(returns_arr) + 1e-8)
-            performance_scores[agent_name] = score
-        
-        best_agent = max(performance_scores, key=performance_scores.get)
-        print("\nAgent Performance Scores:")
-        for agent, score in performance_scores.items():
-            print(f"  {agent}: {score:.4f}")
+    def select_best_agent(self, validation_returns):
+        sharpe_scores = {}
+        for agent_name, rets in validation_returns.items():
+            sharpe_scores[agent_name] = self.calculate_sharpe_ratio(rets)
+        best_agent = max(sharpe_scores, key=sharpe_scores.get)
+        print(f"Validation Sharpe Ratios: {sharpe_scores}")
         print(f"Selected Best Agent: {best_agent}")
-        return best_agent, performance_scores
+        return best_agent, sharpe_scores
 
-    def train_and_select(self, env, training_episodes=15, validation_episodes=2):
+    def get_agent(self, name):
+        agents = {'DDPG': self.ddpg_agent, 'PPO': self.ppo_agent, 'A2C': self.a2c_agent}
+        return agents[name]
+
+    def train_all_agents(self, env, episodes):
+        print(f"Training all agents for {episodes} episodes...")
+        all_returns = {'DDPG': [], 'PPO': [], 'A2C': []}
+
+        for ep in range(episodes):
+            if ep % max(1, episodes // 5) == 0:
+                print(f"Episode {ep+1}/{episodes}")
+            
+            for name in all_returns.keys():
+                env_copy = StockTradingEnv(env.price_data, env.indicator_data)
+                agent = self.get_agent(name)
+
+                state = env_copy.reset()
+                total_reward = 0.0
+                steps = 0
+                max_steps = min(50, len(env.price_data) - 1)
+
+                while steps < max_steps:
+                    if name == 'DDPG':
+                        action = agent.select_action(state)
+                        next_state, reward, done, _ = env_copy.step(action)
+                        agent.add_experience(state, action, reward, next_state, done)
+                        if len(agent.replay_buffer) > 16:
+                            agent.train()
+                    elif name == 'PPO':
+                        action, log_prob, val = agent.select_action(state)
+                        next_state, reward, done, _ = env_copy.step(action)
+                        agent.store_transition(state, action, reward, log_prob, val, done)
+                        if len(agent.states) >= 8:
+                            agent.update()
+                    elif name == 'A2C':
+                        action, log_prob, val = agent.select_action(state)
+                        next_state, reward, done, _ = env_copy.step(action)
+                        agent.store_transition(state, action, reward, next_state, done, log_prob, val)
+                        if len(agent.states) >= 4:
+                            agent.update()
+
+                    state = next_state
+                    total_reward += reward
+                    steps += 1
+                    if done:
+                        break
+                
+                all_returns[name].append(total_reward)
+        return all_returns
+
+    def quarterly_rebalance(self, env, training_episodes=10, validation_episodes=3):
+        print("\nStarting quarterly rebalance...")
         training_returns = self.train_all_agents(env, training_episodes)
-        validation_returns = {
-            'DDPG': training_returns['DDPG'][-validation_episodes:],
-            'PPO': training_returns['PPO'][-validation_episodes:],
-            'A2C': training_returns['A2C'][-validation_episodes:]
-        }
-        best_agent_name, performance_scores = self.select_best_agent(validation_returns)
-        return best_agent_name, performance_scores, training_returns
-
-def load_and_prepare_data(filepath):
-
-    print(f"Loading data from {filepath}")
-    df = pd.read_csv("3yrs.csv")
-
-    required_cols = ['Open', 'High', 'Low', 'Close']
-    for col in required_cols:
-        if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}")
-
-    if 'Date' in df.columns:
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.sort_values('Date').reset_index(drop=True)
-
-    macd_indicator = ta.trend.MACD(close=df['Close'], window_slow=26, window_fast=12, window_sign=9)
-    df['MACD'] = macd_indicator.macd()
-
-    df['RSI'] = ta.momentum.RSIIndicator(close=df['Close'], window=14).rsi()
-
-    df['CCI'] = ta.trend.CCIIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=20).cci()
-
-    df['ADX'] = ta.trend.ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14).adx()
-
-    df.ffill(inplace=True)
-    df.bfill(inplace=True)
-
-    price_data = df['Close'].to_numpy()
-    tech_indicators = {
-        'MACD': df['MACD'].to_numpy(),
-        'RSI': df['RSI'].to_numpy(),
-        'CCI': df['CCI'].to_numpy(),
-        'ADX': df['ADX'].to_numpy()
-    }
-
-    print(f"Data loaded and indicators calculated. {len(price_data)} data points.")
-    return price_data, tech_indicators
+        validation_returns = {k: training_returns[k][-validation_episodes:] for k in training_returns}
+        best_agent, sharpe_scores = self.select_best_agent(validation_returns)
+        return best_agent, sharpe_scores, training_returns
 
 
-def run_backtest(env, agent):
-    state = env.reset()
-    done = False
-    history = []
+def load_data(path):
+    print(f"Loading data from {path}...")
     
-    while not done:
-        action = agent.select_action(state)
+    try:
+        df = pd.read_csv(path)
+    except FileNotFoundError:
+        print(f"Error: File '{path}' not found!")
+        return None, None
+    
+    df.columns = df.columns.str.strip()
+    
+    print(f"Available columns: {df.columns.tolist()}")
+    
+    close_col = None
+    for col in df.columns:
+        if 'close' in col.lower():
+            close_col = col
+            break
+    
+    if close_col is None:
+        print("Error: No 'Close' column found in CSV!")
+        return None, None
+    
+    prices = df[close_col].values.reshape(-1, 1)
+    
+    try:
+        macd, rsi, cci, adx = calculate_technical_indicators(df)
+    except Exception as e:
+        print(f"Error calculating technical indicators: {e}")
+        return None, None
+    
+    indicators = {
+        'macd': macd.reshape(-1, 1),
+        'rsi': rsi.reshape(-1, 1),
+        'cci': cci.reshape(-1, 1),
+        'adx': adx.reshape(-1, 1)
+    }
+    
+    print(f"Loaded {len(prices)} timesteps, 1 stock")
+    print(f"Price range: ₹{prices.min():.2f} - ₹{prices.max():.2f}")
+    
+    return prices, indicators
+
+
+def example_usage():
+    global np
+    print("Starting Ensemble Trading Strategy with real OHLC data...")
+
+    train_prices, train_indicators = load_data('3Years.csv')
+    if train_prices is None:
+        return None, None
         
-        if isinstance(action, tuple):  
-            action = action[0]  
-        if isinstance(action, (list, np.ndarray)) and len(np.shape(action)) > 0:
-            action = np.array(action).flatten()[0]
+    test_prices, test_indicators = load_data('test.csv')
+    if test_prices is None:
+        return None, None
+
+    train_env = StockTradingEnv(train_prices, train_indicators)
+    test_env = StockTradingEnv(test_prices, test_indicators)
+
+    print(f"Training environment: {train_env.num_stocks} stock(s), {len(train_prices)} timesteps")
+    print(f"Test environment: {test_env.num_stocks} stock(s), {len(test_prices)} timesteps")
+
+    ensemble = EnsembleStrategy(train_env.state_dim, train_env.action_dim)
+    best_agent, sharpe_scores, _ = ensemble.quarterly_rebalance(
+        train_env, training_episodes=50, validation_episodes=10
+    )
+
+    print(f"\n=== Testing Best Agent: {best_agent} ===")
+    agent = ensemble.get_agent(best_agent)
+
+    state = test_env.reset()
+    initial_value = test_env.balance + np.sum(test_env.holdings * test_env.prices)
+    portfolio_values = [initial_value]
+
+    print(f"Initial portfolio: ₹{initial_value:,.2f}")
+    print("Trading progress:")
+
+    for step in range(min(15, len(test_prices)-1)):
+        if best_agent == 'DDPG':
+            action = agent.select_action(state, add_noise=False)
+        else:
+            action, _, _ = agent.select_action(state)
         
-        next_state, reward, done, info = env.step(action)
+        next_state, reward, done, info = test_env.step(action)
+        portfolio_values.append(info['portfolio_value'])
+        
+        if step % 3 == 0:
+            print(f"  Step {step+1}: Portfolio = ₹{info['portfolio_value']:,.2f}, "
+                  f"Action = {action[0]:.3f}, Holdings = {test_env.holdings[0]}")
+        
         state = next_state
-        history.append(info['portfolio_value'])
-        
-    return pd.Series(history)
+        if done:
+            print(f"  Episode ended at step {step+1}")
+            break
 
-def plot_results(backtest_history, price_data, initial_balance):
-    plt.style.use('seaborn-v0_8-darkgrid')
-    fig, ax = plt.subplots(figsize=(14, 7))
+    final_value = portfolio_values[-1]
+    total_return = 100.0 * (final_value - initial_value) / initial_value
 
-    # Agent's performance
-    backtest_history.plot(ax=ax, label='Ensemble Strategy', color='royalblue')
+    print(f"\n=== FINAL RESULTS ===")
+    print(f"Initial portfolio value: ₹{initial_value:,.2f}")
+    print(f"Final portfolio value:   ₹{final_value:,.2f}")
+    print(f"Total return:            {total_return:.2f}%")
+    print(f"Best agent:              {best_agent}")
+    print(f"Number of test steps:    {len(portfolio_values)-1}")
 
-    # Buy and Hold performance
-    buy_hold_value = (price_data / price_data[0]) * initial_balance
-    plt.plot(buy_hold_value, label='Buy and Hold', color='gray', linestyle='--')
+    returns = np.diff(portfolio_values) / portfolio_values[:-1]
+    cum_return = (final_value / initial_value) - 1
+    n_years = len(portfolio_values) / 252  
+    ann_return = (final_value / initial_value) ** (1 / n_years) - 1 if n_years > 0 else 0
+    vol = np.std(returns) * np.sqrt(252) if len(returns) > 1 else 0
+    sharpe = (np.mean(returns) * 252 - 0.02) / (np.std(returns) * np.sqrt(252) + 1e-8) if len(returns) > 1 else 0
+    stats = {'cum': cum_return, 'ann': ann_return, 'vol': vol, 'sharpe': sharpe}
+    print(f"Strategy stats: {stats}")
 
-    ax.set_title('Trading Strategy Performance vs. Buy and Hold', fontsize=16)
-    ax.set_xlabel('Time Steps', fontsize=12)
-    ax.set_ylabel('Portfolio Value (₹)', fontsize=12)
-    ax.legend(fontsize=12)
-    plt.tight_layout()
-    plt.show()
+    return ensemble, portfolio_values
+
 
 if __name__ == '__main__':
-    CSV_FILE_PATH = '3yrs.csv'
-    INITIAL_BALANCE = 1000000
-    TRAINING_EPISODES = 50
-    VALIDATION_EPISODES = 8
-
-    price_data_np, tech_indicators = load_and_prepare_data(CSV_FILE_PATH)
-
-
-
-    env = ImprovedNiftyTradingEnv(
-        price_data=price_data_np,
-        technical_indicators=tech_indicators,
-        initial_balance=INITIAL_BALANCE
-    )
-    ensemble = ImprovedEnsembleStrategy(env.state_dim, env.action_dim)
-
-    best_agent_name, _, _ = ensemble.train_and_select(
-        env,
-        training_episodes=TRAINING_EPISODES,
-        validation_episodes=VALIDATION_EPISODES
-    )
-    best_agent = ensemble.get_agent(best_agent_name)
-
-    print(f"\nBacktesting Best Agent: {best_agent_name}")
-    backtest_env = ImprovedNiftyTradingEnv(
-        price_data=price_data_np,
-        technical_indicators=tech_indicators,
-        initial_balance=INITIAL_BALANCE
-    )
-    backtest_history = run_backtest(backtest_env, best_agent)
-
-    final_portfolio_value = backtest_history.iloc[-1]
-    total_return_pct = (final_portfolio_value - INITIAL_BALANCE) / INITIAL_BALANCE * 100
-    
-    buy_hold_final_value = (price_data_np[-1] / price_data_np[0]) * INITIAL_BALANCE
-    buy_hold_return_pct = (buy_hold_final_value - INITIAL_BALANCE) / INITIAL_BALANCE * 100
-
-    print("\nBacktest Results")
-    print(f"Final Portfolio Value: ₹{final_portfolio_value:,.2f}")
-    print(f"Total Return: {total_return_pct:.2f}%")
-    print(f"Buy and Hold Final Value: ₹{buy_hold_final_value:,.2f}")
-    print(f"Buy and Hold Return: {buy_hold_return_pct:.2f}%")
-
-    plot_results(backtest_history, price_data_np, INITIAL_BALANCE)
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-def calculate_risk_metrics(portfolio_values, risk_free_rate=0.02):
-    returns = pd.Series(portfolio_values).pct_change().dropna()
-    
-    ann_factor = 252  
-    
-    volatility = returns.std() * np.sqrt(ann_factor)
-    sharpe_ratio = (returns.mean() * ann_factor - risk_free_rate) / volatility if volatility != 0 else np.nan
-    
-    downside_returns = returns[returns < 0]
-    downside_volatility = downside_returns.std() * np.sqrt(ann_factor)
-    sortino_ratio = (returns.mean() * ann_factor - risk_free_rate) / downside_volatility if downside_volatility != 0 else np.nan
-    
-    cumulative = (1 + returns).cumprod()
-    peak = cumulative.cummax()
-    drawdown = (cumulative - peak) / peak
-    max_drawdown = drawdown.min()
-    
-    calmar_ratio = (returns.mean() * ann_factor - risk_free_rate) / abs(max_drawdown) if max_drawdown != 0 else np.nan
-    
-    return {
-        "Annualized Volatility": volatility,
-        "Sharpe Ratio": sharpe_ratio,
-        "Sortino Ratio": sortino_ratio,
-        "Max Drawdown": max_drawdown,
-        "Calmar Ratio": calmar_ratio
-    }
-
-metrics = calculate_risk_metrics(backtest_history, risk_free_rate=0.02)
-print("\nRisk Metrics")
-for k, v in metrics.items():
-    print(f"{k}: {v:.4f}")
+    ensemble, results = example_usage()
